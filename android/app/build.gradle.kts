@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.waiting_room_app_workshop2"
+    namespace = "com.example.waiting_room_app_workshop5"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
