@@ -23,9 +23,27 @@ class LocalQueueService {
         onCreate: _onCreate,
       );
     } else {
-      final dbPath = await getDatabasesPath();
-      final path = join(dbPath, 'waiting_room.db');
-      return openDatabase(path, version: 1, onCreate: _onCreate);
+      try {
+        final dbPath = await getDatabasesPath();
+        final path = join(dbPath, 'waiting_room.db');
+        return await openDatabase(
+          path,
+          version: 1,
+          onCreate: _onCreate,
+          onOpen: (db) async {
+            print('✅ Database opened successfully at: $path');
+          },
+        );
+      } catch (e) {
+        print('❌ Error initializing database: $e');
+        // Fallback to in-memory database if file-based fails
+        print('⚠️ Falling back to in-memory database');
+        return await openDatabase(
+          ':memory:',
+          version: 1,
+          onCreate: _onCreate,
+        );
+      }
     }
   }
 

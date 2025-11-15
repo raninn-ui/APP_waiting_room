@@ -104,39 +104,71 @@ class QueueProvider extends ChangeNotifier {
       }
 
       // 1️⃣ Load local clients (native)
-      final localClients = await _localDb.getClients();
-      _clients
-        ..clear()
-        ..addAll(localClients);
-
-      // 2️⃣ Load remote clients from Supabase
-      final response = await _supabase
-          .from('clients')
-          .select()
-          .order('created_at');
-      final remoteClients = (response as List<dynamic>)
-          .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
-          .toList();
-
-      // Insert into local DB if not already present
-      for (var rc in remoteClients) {
-        if (!_clients.any((c) => c['id'] == rc['id'])) {
-          await _localDb.insertClientLocally(rc);
-          _clients.add(rc);
-        }
+      try {
+        debugPrint('📂 Loading local clients from SQLite...');
+        final localClients = await _localDb.getClients();
+        debugPrint('✅ Loaded ${localClients.length} local clients');
+        _clients
+          ..clear()
+          ..addAll(localClients);
+      } catch (e) {
+        debugPrint('⚠️ Error loading local clients: $e');
+        // Continue even if local DB fails
       }
 
-      _clients.sort(
-              (a, b) => (a['created_at'] as String).compareTo(b['created_at'] as String));
-      notifyListeners();
+      // 2️⃣ Load remote clients from Supabase
+      try {
+        debugPrint('🌐 Loading remote clients from Supabase...');
+        final response = await _supabase
+            .from('clients')
+            .select()
+            .order('created_at');
+        final remoteClients = (response as List<dynamic>)
+            .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
+            .toList();
+        debugPrint('✅ Loaded ${remoteClients.length} remote clients');
+
+        // Insert into local DB if not already present
+        for (var rc in remoteClients) {
+          if (!_clients.any((c) => c['id'] == rc['id'])) {
+            try {
+              await _localDb.insertClientLocally(rc);
+              _clients.add(rc);
+            } catch (e) {
+              debugPrint('⚠️ Error inserting client ${rc['id']} locally: $e');
+              // Add to memory even if local insert fails
+              _clients.add(rc);
+            }
+          }
+        }
+
+        _clients.sort(
+                (a, b) => (a['created_at'] as String).compareTo(b['created_at'] as String));
+        notifyListeners();
+      } catch (e) {
+        debugPrint('⚠️ Error loading remote clients: $e');
+        // Continue with local clients only
+        notifyListeners();
+      }
 
       // 3️⃣ Sync unsynced local clients to Supabase
-      await _syncLocalToRemote();
+      try {
+        await _syncLocalToRemote();
+      } catch (e) {
+        debugPrint('⚠️ Error syncing to remote: $e');
+      }
 
       // 4️⃣ Setup Realtime subscription
-      _setupRealtimeSubscription();
-    } catch (e) {
-      debugPrint('Error loading queue: $e');
+      try {
+        _setupRealtimeSubscription();
+      } catch (e) {
+        debugPrint('⚠️ Error setting up realtime: $e');
+      }
+    } catch (e, stackTrace) {
+      debugPrint('❌ Critical error loading queue: $e');
+      debugPrint('Stack trace: $stackTrace');
+      // Ensure UI is notified even on error
+      notifyListeners();
     }
   }
 
@@ -163,7 +195,13 @@ class QueueProvider extends ChangeNotifier {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return;
 
+    debugPrint('📍 Getting location for new client...');
     final position = await _geoService.getCurrentPosition();
+    if (position != null) {
+      debugPrint('✅ Location obtained: ${position.latitude}, ${position.longitude}');
+    } else {
+      debugPrint('⚠️ Location not available');
+    }
 
     final newClient = {
       'id': const Uuid().v4(),
@@ -174,8 +212,10 @@ class QueueProvider extends ChangeNotifier {
     };
 
     try {
-      // 1️⃣ Insert directly on Supabase
-      await _supabase.from('clients').upsert(newClient);
+      // 1️⃣ Insert directly on Supabase (use insert instead of upsert)
+      debugPrint('➕ Inserting client to Supabase: $trimmed');
+      await _supabase.from('clients').insert(newClient);
+      debugPrint('✅ Client inserted to Supabase successfully');
 
       if (kIsWeb) {
         // Web: ensure immediate consistency by refetching from remote
@@ -191,8 +231,9 @@ class QueueProvider extends ChangeNotifier {
       _clients.sort((a, b) =>
           (a['created_at'] as String).compareTo(b['created_at'] as String));
       notifyListeners();
+      debugPrint('✅ Client added to local list');
     } catch (e) {
-      debugPrint('Error adding client to Supabase: $e');
+      debugPrint('❌ Error adding client to Supabase: $e');
 
       if (!kIsWeb) {
         // If Supabase fails (native), store locally as unsynced
@@ -210,19 +251,23 @@ class QueueProvider extends ChangeNotifier {
 
   Future<void> removeClient(String id) async {
     try {
+      debugPrint('🗑️ Removing client from Supabase: $id');
       // Remove from Supabase
       await _supabase.from('clients').delete().eq('id', id);
+      debugPrint('✅ Client removed from Supabase');
 
       if (!kIsWeb) {
         // Remove from local DB (native)
         final db = await _localDb.database;
         await db.delete(LocalQueueService.tableName, where: 'id = ?', whereArgs: [id]);
+        debugPrint('✅ Client removed from local DB');
       }
 
       _clients.removeWhere((c) => c['id'] == id);
       notifyListeners();
+      debugPrint('✅ Client removed from UI');
     } catch (e) {
-      debugPrint('Failed to remove client: $e');
+      debugPrint('❌ Failed to remove client: $e');
     }
   }
 

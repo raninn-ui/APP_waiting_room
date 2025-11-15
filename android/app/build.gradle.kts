@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.waiting_room_app_workshop5"
+    namespace = "com.example.waiting_room_app_workshop2"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -24,7 +24,7 @@ android {
         applicationId = "com.example.waiting_room_app_workshop2"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        minSdk = flutter.minSdkVersion  // Required for Supabase and modern Flutter plugins
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
