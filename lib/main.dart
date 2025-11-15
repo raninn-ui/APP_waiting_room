@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'queue_provider.dart';
+import 'connectivity_service.dart';
+import 'room_list_screen.dart';
 
 Future<void> main() async {
   // Wrap everything in error handling to prevent crashes
@@ -33,15 +35,34 @@ Future<void> main() async {
     }
 
     runApp(
-      ChangeNotifierProvider(
-        create: (_) {
-          print('🏗️ Creating QueueProvider...');
-          final provider = QueueProvider();
-          provider.initialize().catchError((e) {
-            print('⚠️ QueueProvider initialization error: $e');
-          });
-          return provider;
-        },
+      MultiProvider(
+        providers: [
+          // Connectivity service
+          ChangeNotifierProvider(
+            create: (_) => ConnectivityService(),
+          ),
+          // Queue provider with connectivity listener
+          ChangeNotifierProxyProvider<ConnectivityService, QueueProvider>(
+            create: (_) {
+              print('🏗️ Creating QueueProvider...');
+              final provider = QueueProvider();
+              provider.initialize().catchError((e) {
+                print('⚠️ QueueProvider initialization error: $e');
+              });
+              return provider;
+            },
+            update: (context, connectivityService, queueProvider) {
+              // Listen for connectivity changes
+              if (queueProvider != null && connectivityService.isOnline) {
+                // Trigger sync when coming back online
+                queueProvider.onConnectivityRestored().catchError((e) {
+                  print('⚠️ Sync error: $e');
+                });
+              }
+              return queueProvider!;
+            },
+          ),
+        ],
         child: const WaitingRoomApp(),
       ),
     );
@@ -88,14 +109,16 @@ class WaitingRoomApp extends StatelessWidget {
     return MaterialApp(
       title: 'Waiting Room',
       theme: ThemeData(primarySwatch: Colors.blue),
-      home: const WaitingRoomPage(),
+      home: const RoomListScreen(), // Start with room selection (Part 3 of workshop)
       debugShowCheckedModeBanner: false,
     );
   }
 }
 
 class WaitingRoomPage extends StatefulWidget {
-  const WaitingRoomPage({super.key});
+  final String? roomId;
+
+  const WaitingRoomPage({super.key, this.roomId});
 
   @override
   State<WaitingRoomPage> createState() => _WaitingRoomPageState();
@@ -105,16 +128,49 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
   final TextEditingController _controller = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    // Subscribe to the specific room if roomId is provided
+    if (widget.roomId != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        context.read<QueueProvider>().subscribeToRoom(widget.roomId!);
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final provider = context.watch<QueueProvider>();
+    final connectivityService = context.watch<ConnectivityService>();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Waiting Room')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Row(children: [
+      body: Column(
+        children: [
+          // Offline Banner
+          if (!connectivityService.isOnline)
+            Container(
+              padding: const EdgeInsets.all(8),
+              color: Colors.red[800],
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.cloud_off, color: Colors.white, size: 16),
+                  SizedBox(width: 8),
+                  Text(
+                    'Offline Mode - Data will sync when connected.',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+          // Main content
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(children: [
               Expanded(
                 child: TextField(
                   controller: _controller,
@@ -144,14 +200,29 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                 itemBuilder: (context, i) {
                   final client = provider.clients[i];
 
+                  final roomName = provider.getRoomName(client['waiting_room_id']);
+
                   return Card(
                     margin: const EdgeInsets.symmetric(vertical: 4),
                     child: ListTile(
+                      leading: const Icon(Icons.person, color: Colors.blue),
                       title: Text(client['name'] ?? 'Unnamed'),
-                      subtitle: Text(
-                        client['lat'] == null
-                            ? '📍 Location not captured'
-                            : '📍 ${client['lat']}, ${client['lng']}',
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '🏢 $roomName',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.green,
+                            ),
+                          ),
+                          Text(
+                            client['lat'] == null
+                                ? '📍 Location not captured'
+                                : '📍 ${client['lat']}, ${client['lng']}',
+                          ),
+                        ],
                       ),
                       trailing: IconButton(
                         icon: const Icon(Icons.delete, color: Colors.red),
@@ -165,14 +236,17 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
 
             const SizedBox(height: 12),
 
-            ElevatedButton.icon(
-              onPressed: provider.nextClient,
-              icon: const Icon(Icons.arrow_forward),
-              label: const Text('Next Client'),
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                  ElevatedButton.icon(
+                    onPressed: provider.nextClient,
+                    icon: const Icon(Icons.arrow_forward),
+                    label: const Text('Next Client'),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

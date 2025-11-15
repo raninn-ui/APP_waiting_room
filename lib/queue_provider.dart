@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 import 'models/client.dart';
 import 'local_queue_service.dart';
 import 'geolocation_service.dart';
+import 'location_utils.dart';
 
 class QueueProvider extends ChangeNotifier {
   final SupabaseClient _supabase;
@@ -16,6 +17,25 @@ class QueueProvider extends ChangeNotifier {
   late RealtimeChannel _channel;
   final List<Map<String, dynamic>> _clients = [];
   List<Map<String, dynamic>> get clients => List.unmodifiable(_clients);
+
+  // Room management
+  final List<Map<String, dynamic>> _rooms = [];
+  List<Map<String, dynamic>> get rooms => List.unmodifiable(_rooms);
+
+  // Track current active room
+  String? _currentRoomId;
+  String? get currentRoomId => _currentRoomId;
+
+  /// Get room name by room ID
+  String getRoomName(String? roomId) {
+    if (roomId == null) return 'Unknown Room';
+    try {
+      final room = _rooms.firstWhere((r) => r['id'] == roomId);
+      return room['name'] ?? 'Unknown Room';
+    } catch (e) {
+      return 'Unknown Room';
+    }
+  }
 
   Timer? _periodicSyncTimer;
   Timer? _periodicWebRefreshTimer;
@@ -28,8 +48,25 @@ class QueueProvider extends ChangeNotifier {
         _geoService = geoService ?? GeolocationService(),
         _localDb = localDb ?? LocalQueueService();
 
+  /// Set up connectivity listener to trigger sync when coming back online
+  void setupConnectivityListener(void Function() onConnectivityChanged) {
+    // This will be called from main.dart when ConnectivityService changes
+    onConnectivityChanged();
+  }
+
+  /// Trigger sync when connectivity is restored
+  Future<void> onConnectivityRestored() async {
+    debugPrint('🔄 Connectivity restored, triggering sync...');
+    await _syncLocalToRemote();
+    // Reload queue to get latest data
+    await _loadQueue();
+  }
+
   /// Initialize queue (local + remote + realtime)
   Future<void> initialize() async {
+    // Load waiting rooms first
+    await fetchWaitingRooms();
+
     await _loadQueue();
 
     // 🔁 Start periodic background sync (native platforms only)
@@ -191,29 +228,116 @@ class QueueProvider extends ChangeNotifier {
     }
   }
 
+  /// Fetch all waiting rooms from Supabase (with offline fallback)
+  Future<void> fetchWaitingRooms() async {
+    try {
+      // First, try to load from local cache
+      final localRooms = await _localDb.getWaitingRooms();
+      if (localRooms.isNotEmpty) {
+        _rooms.clear();
+        _rooms.addAll(localRooms);
+        debugPrint('✅ Loaded ${_rooms.length} waiting rooms from local cache');
+        notifyListeners();
+      }
+
+      // Then try to fetch from remote (if online)
+      try {
+        debugPrint('🏥 Fetching waiting rooms from Supabase...');
+        final response = await _supabase
+            .from('waiting_rooms')
+            .select()
+            .order('name');
+
+        final remoteRooms = (response as List<dynamic>).cast<Map<String, dynamic>>();
+
+        // Save to local cache for offline use
+        await _localDb.saveWaitingRooms(remoteRooms);
+
+        _rooms.clear();
+        _rooms.addAll(remoteRooms);
+        debugPrint('✅ Loaded ${_rooms.length} waiting rooms from Supabase');
+        notifyListeners();
+      } catch (e) {
+        debugPrint('⚠️ Could not fetch from Supabase (offline?): $e');
+        // If we already have local rooms, that's fine
+        if (_rooms.isNotEmpty) {
+          debugPrint('✅ Using ${_rooms.length} cached waiting rooms (offline mode)');
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ Error fetching waiting rooms: $e');
+    }
+  }
+
+  /// Find the nearest waiting room to the given coordinates
+  Future<String?> _findNearestRoom(double clientLat, double clientLng) async {
+    if (_rooms.isEmpty) await fetchWaitingRooms();
+
+    if (_rooms.isEmpty) {
+      debugPrint('⚠️ No waiting rooms available');
+      return null;
+    }
+
+    double minDistance = double.infinity;
+    String? nearestRoomId;
+
+    for (var room in _rooms) {
+      final roomLat = room['latitude'] as double;
+      final roomLng = room['longitude'] as double;
+      final distance = calculateDistance(clientLat, clientLng, roomLat, roomLng);
+
+      debugPrint('📏 Distance to ${room['name']}: ${distance.toStringAsFixed(2)} km');
+
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestRoomId = room['id'] as String;
+      }
+    }
+
+    debugPrint('✅ Nearest room: $nearestRoomId (${minDistance.toStringAsFixed(2)} km)');
+    return nearestRoomId;
+  }
+
   Future<void> addClient(String name) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return;
 
     debugPrint('📍 Getting location for new client...');
     final position = await _geoService.getCurrentPosition();
+
+    // Use position from GeolocationService (which has default fallback built-in)
+    final clientLat = position?.latitude ?? 40.7128; // NYC default
+    final clientLng = position?.longitude ?? -74.0060; // NYC default
+
     if (position != null) {
-      debugPrint('✅ Location obtained: ${position.latitude}, ${position.longitude}');
+      debugPrint('✅ Location obtained: $clientLat, $clientLng');
     } else {
-      debugPrint('⚠️ Location not available');
+      debugPrint('⚠️ Location not available, using default NYC location ($clientLat, $clientLng)');
     }
+
+    // Find nearest room based on location (AUTO-ASSIGNMENT)
+    final roomId = await _findNearestRoom(clientLat, clientLng);
+
+    // Check if room was found before inserting
+    if (roomId == null) {
+      debugPrint('❌ No waiting room found, cannot add client');
+      return;
+    }
+
+    debugPrint('🎯 Auto-assigned to nearest room: $roomId');
 
     final newClient = {
       'id': const Uuid().v4(),
       'name': trimmed,
-      'lat': position?.latitude,
-      'lng': position?.longitude,
+      'lat': clientLat,
+      'lng': clientLng,
+      'waiting_room_id': roomId,
       'created_at': DateTime.now().toIso8601String(),
     };
 
     try {
       // 1️⃣ Insert directly on Supabase (use insert instead of upsert)
-      debugPrint('➕ Inserting client to Supabase: $trimmed');
+      debugPrint('➕ Inserting client to Supabase: $trimmed (room: $roomId)');
       await _supabase.from('clients').insert(newClient);
       debugPrint('✅ Client inserted to Supabase successfully');
 
@@ -277,7 +401,7 @@ class QueueProvider extends ChangeNotifier {
     await removeClient(first['id'] as String);
   }
 
-  void _setupRealtimeSubscription() {
+  void _setupRealtimeSubscription({String? roomId}) {
     _channel = _supabase.channel('clients_channel');
 
     _channel.onPostgresChanges(
@@ -289,6 +413,11 @@ class QueueProvider extends ChangeNotifier {
         final record = payload.newRecord ?? payload.oldRecord;
 
         if (record == null) return;
+
+        // Filter by room if roomId is specified
+        if (roomId != null && record['waiting_room_id'] != roomId) {
+          return;
+        }
 
         if (event == PostgresChangeEvent.insert) {
           if (!_clients.any((c) => c['id'] == record['id'])) {
@@ -318,6 +447,97 @@ class QueueProvider extends ChangeNotifier {
     );
 
     _channel.subscribe();
+  }
+
+  /// Subscribe to a specific waiting room's realtime updates
+  /// This cancels the current subscription and creates a new one filtered by roomId
+  void subscribeToRoom(String roomId) {
+    try {
+      debugPrint('🔄 Subscribing to room: $roomId');
+
+      // Track the current room
+      _currentRoomId = roomId;
+
+      // Cancel old subscription
+      _channel.unsubscribe();
+
+      // Load clients for this specific room
+      _loadClientsForRoom(roomId);
+
+      // Create new channel with room-specific filter
+      // Note: Supabase realtime filters work at the database level
+      _channel = _supabase.channel('room_${roomId}_channel');
+
+      _channel.onPostgresChanges(
+        schema: 'public',
+        table: 'clients',
+        event: PostgresChangeEvent.all,
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'waiting_room_id',
+          value: roomId,
+        ),
+        callback: (payload) async {
+          final event = payload.eventType;
+          final record = payload.newRecord ?? payload.oldRecord;
+
+          if (record == null) return;
+
+          if (event == PostgresChangeEvent.insert) {
+            if (!_clients.any((c) => c['id'] == record['id'])) {
+              if (!kIsWeb) {
+                await _localDb.insertClientLocally({
+                  ...Map<String, dynamic>.from(record),
+                  'is_synced': 1,
+                });
+              }
+              _clients.add({...record, 'is_synced': 1});
+              _clients.sort((a, b) =>
+                  (a['created_at'] as String).compareTo(b['created_at'] as String));
+              notifyListeners();
+            }
+          } else if (event == PostgresChangeEvent.delete) {
+            final id = record['id'] as String?;
+            if (id != null) {
+              if (!kIsWeb) {
+                final db = await _localDb.database;
+                await db.delete(LocalQueueService.tableName, where: 'id = ?', whereArgs: [id]);
+              }
+              _clients.removeWhere((c) => c['id'] == id);
+              notifyListeners();
+            }
+          }
+        },
+      );
+
+      _channel.subscribe();
+      debugPrint('✅ Subscribed to room: $roomId');
+    } catch (e) {
+      debugPrint('❌ Error subscribing to room: $e');
+    }
+  }
+
+  /// Load clients for a specific room
+  Future<void> _loadClientsForRoom(String roomId) async {
+    try {
+      debugPrint('📥 Loading clients for room: $roomId');
+      final response = await _supabase
+          .from('clients')
+          .select()
+          .eq('waiting_room_id', roomId)
+          .order('created_at');
+
+      final roomClients = (response as List<dynamic>)
+          .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
+          .toList();
+
+      _clients.clear();
+      _clients.addAll(roomClients);
+      notifyListeners();
+      debugPrint('✅ Loaded ${roomClients.length} clients for room');
+    } catch (e) {
+      debugPrint('❌ Error loading clients for room: $e');
+    }
   }
 
   @override
