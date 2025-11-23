@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'queue_provider.dart';
 import 'connectivity_service.dart';
 import 'room_list_screen.dart';
+import 'geolocation_service.dart';
 
 Future<void> main() async {
   // Wrap everything in error handling to prevent crashes
@@ -32,6 +33,15 @@ Future<void> main() async {
       print('✅ Anonymous login OK');
     } catch (e) {
       print('⚠️ Anonymous login failed: $e');
+    }
+
+    // ---------- REQUEST LOCATION PERMISSION AT STARTUP ----------
+    try {
+      print('📍 Requesting location permission...');
+      final geoService = GeolocationService();
+      await geoService.requestPermissionAtStartup();
+    } catch (e) {
+      print('⚠️ Location permission request failed: $e');
     }
 
     runApp(
@@ -117,8 +127,9 @@ class WaitingRoomApp extends StatelessWidget {
 
 class WaitingRoomPage extends StatefulWidget {
   final String? roomId;
+  final String? roomName;
 
-  const WaitingRoomPage({super.key, this.roomId});
+  const WaitingRoomPage({super.key, this.roomId, this.roomName});
 
   @override
   State<WaitingRoomPage> createState() => _WaitingRoomPageState();
@@ -132,8 +143,8 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
     super.initState();
     // Subscribe to the specific room if roomId is provided
     if (widget.roomId != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        context.read<QueueProvider>().subscribeToRoom(widget.roomId!);
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await context.read<QueueProvider>().subscribeToRoom(widget.roomId!);
       });
     }
   }
@@ -144,7 +155,9 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
     final connectivityService = context.watch<ConnectivityService>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Waiting Room')),
+      appBar: AppBar(
+        title: Text(widget.roomName ?? 'Waiting Room'),
+      ),
       body: Column(
         children: [
           // Offline Banner
@@ -175,17 +188,45 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                 child: TextField(
                   controller: _controller,
                   decoration: const InputDecoration(hintText: 'Enter client name'),
-                  onSubmitted: (v) {
-                    provider.addClient(v);
+                  onSubmitted: (v) async {
+                    // Only use chosen room when offline
+                    final roomName = await provider.addClient(
+                      v,
+                      chosenRoomId: connectivityService.isOnline ? null : widget.roomId,
+                    );
                     _controller.clear();
+                    if (roomName != null && mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('✅ Client ajouté dans $roomName!'),
+                          backgroundColor: Colors.green,
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
               ),
               const SizedBox(width: 8),
               ElevatedButton(
-                onPressed: () {
-                  provider.addClient(_controller.text);
+                onPressed: () async {
+                  // Only use chosen room when offline
+                  final roomName = await provider.addClient(
+                    _controller.text,
+                    chosenRoomId: connectivityService.isOnline ? null : widget.roomId,
+                  );
                   _controller.clear();
+                  if (roomName != null && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('✅ Client ajouté dans $roomName!'),
+                        backgroundColor: Colors.green,
+                        duration: const Duration(seconds: 2),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
                 },
                 child: const Text('Add'),
               ),
