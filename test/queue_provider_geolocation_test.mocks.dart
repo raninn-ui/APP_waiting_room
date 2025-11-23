@@ -34,6 +34,15 @@ class MockGeolocationService extends _i1.Mock
   }
 
   @override
+  _i3.Future<void> requestPermissionAtStartup() =>
+      (super.noSuchMethod(
+            Invocation.method(#requestPermissionAtStartup, []),
+            returnValue: _i3.Future<void>.value(),
+            returnValueForMissingStub: _i3.Future<void>.value(),
+          )
+          as _i3.Future<void>);
+
+  @override
   _i3.Future<_i4.Position?> getCurrentPosition() =>
       (super.noSuchMethod(
             Invocation.method(#getCurrentPosition, []),

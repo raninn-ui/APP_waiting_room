@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'queue_provider.dart';
 import 'connectivity_service.dart';
 import 'room_list_screen.dart';
+import 'geolocation_service.dart';
 
 Future<void> main() async {
   // Wrap everything in error handling to prevent crashes
@@ -32,6 +33,15 @@ Future<void> main() async {
       print('✅ Anonymous login OK');
     } catch (e) {
       print('⚠️ Anonymous login failed: $e');
+    }
+
+    // ---------- REQUEST LOCATION PERMISSION AT STARTUP ----------
+    try {
+      print('📍 Requesting location permission...');
+      final geoService = GeolocationService();
+      await geoService.requestPermissionAtStartup();
+    } catch (e) {
+      print('⚠️ Location permission request failed: $e');
     }
 
     runApp(
@@ -117,8 +127,9 @@ class WaitingRoomApp extends StatelessWidget {
 
 class WaitingRoomPage extends StatefulWidget {
   final String? roomId;
+  final String? roomName;
 
-  const WaitingRoomPage({super.key, this.roomId});
+  const WaitingRoomPage({super.key, this.roomId, this.roomName});
 
   @override
   State<WaitingRoomPage> createState() => _WaitingRoomPageState();
@@ -132,8 +143,8 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
     super.initState();
     // Subscribe to the specific room if roomId is provided
     if (widget.roomId != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        context.read<QueueProvider>().subscribeToRoom(widget.roomId!);
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await context.read<QueueProvider>().subscribeToRoom(widget.roomId!);
       });
     }
   }
@@ -144,7 +155,9 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
     final connectivityService = context.watch<ConnectivityService>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Waiting Room')),
+      appBar: AppBar(
+        title: Text(widget.roomName ?? 'Waiting Room'),
+      ),
       body: Column(
         children: [
           // Offline Banner
@@ -175,17 +188,45 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                 child: TextField(
                   controller: _controller,
                   decoration: const InputDecoration(hintText: 'Enter client name'),
-                  onSubmitted: (v) {
-                    provider.addClient(v);
+                  onSubmitted: (v) async {
+                    // Only use chosen room when offline
+                    final roomName = await provider.addClient(
+                      v,
+                      chosenRoomId: connectivityService.isOnline ? null : widget.roomId,
+                    );
                     _controller.clear();
+                    if (roomName != null && mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('✅ Client ajouté dans $roomName!'),
+                          backgroundColor: Colors.green,
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
               ),
               const SizedBox(width: 8),
               ElevatedButton(
-                onPressed: () {
-                  provider.addClient(_controller.text);
+                onPressed: () async {
+                  // Only use chosen room when offline
+                  final roomName = await provider.addClient(
+                    _controller.text,
+                    chosenRoomId: connectivityService.isOnline ? null : widget.roomId,
+                  );
                   _controller.clear();
+                  if (roomName != null && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('✅ Client ajouté dans $roomName!'),
+                        backgroundColor: Colors.green,
+                        duration: const Duration(seconds: 2),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
                 },
                 child: const Text('Add'),
               ),
@@ -237,7 +278,76 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
             const SizedBox(height: 12),
 
                   ElevatedButton.icon(
-                    onPressed: provider.nextClient,
+                    onPressed: () async {
+                      // Get the clients before removing
+                      final clients = provider.clients;
+                      if (clients.isEmpty) return;
+
+                      // Get clients for current room
+                      final roomClients = widget.roomId != null
+                          ? clients.where((c) => c['waiting_room_id'] == widget.roomId).toList()
+                          : clients;
+
+                      if (roomClients.isEmpty) return;
+
+                      // Call nextClient to remove the first person
+                      await provider.nextClient();
+
+                      // Show notifications for the next people in line
+                      if (mounted) {
+                        final updatedClients = provider.clients;
+                        final updatedRoomClients = widget.roomId != null
+                            ? updatedClients.where((c) => c['waiting_room_id'] == widget.roomId).toList()
+                            : updatedClients;
+
+                        // Show notification for position 2 (if exists)
+                        if (updatedRoomClients.length > 2) {
+                          final client = updatedRoomClients[2];
+                          final name = client['name'] as String;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('$name, only 2 people are ahead of you'),
+                              backgroundColor: Colors.blue,
+                              duration: const Duration(seconds: 3),
+                            ),
+                          );
+                        }
+
+                        // Show notification for position 1 (if exists)
+                        if (updatedRoomClients.length > 1) {
+                          final client = updatedRoomClients[1];
+                          final name = client['name'] as String;
+                          Future.delayed(const Duration(milliseconds: 500), () {
+                            if (mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text('$name, only 1 person is ahead of you'),
+                                  backgroundColor: Colors.orange,
+                                  duration: const Duration(seconds: 3),
+                                ),
+                              );
+                            }
+                          });
+                        }
+
+                        // Show notification for position 0 (if exists)
+                        if (updatedRoomClients.isNotEmpty) {
+                          final client = updatedRoomClients[0];
+                          final name = client['name'] as String;
+                          Future.delayed(const Duration(seconds: 1), () {
+                            if (mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text('$name, it\'s your turn!'),
+                                  backgroundColor: Colors.green,
+                                  duration: const Duration(seconds: 3),
+                                ),
+                              );
+                            }
+                          });
+                        }
+                      }
+                    },
                     icon: const Icon(Icons.arrow_forward),
                     label: const Text('Next Client'),
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.green),

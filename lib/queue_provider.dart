@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
-import 'models/client.dart';
 import 'local_queue_service.dart';
 import 'geolocation_service.dart';
 import 'location_utils.dart';
@@ -106,14 +105,13 @@ class QueueProvider extends ChangeNotifier {
       final list = await _supabase
           .from('clients')
           .select()
-          .order('created_at');
+          .order('created_at', ascending: true);
       final remoteClients = (list as List<dynamic>)
           .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
           .toList();
       _clients
         ..clear()
         ..addAll(remoteClients);
-      _clients.sort((a, b) => (a['created_at'] as String).compareTo(b['created_at'] as String));
       notifyListeners();
     } catch (e) {
       debugPrint('Web fetch error: $e');
@@ -123,18 +121,16 @@ class QueueProvider extends ChangeNotifier {
   Future<void> _loadQueue() async {
     try {
       if (kIsWeb) {
-        // Web: no local SQLite → load remote only, then subscribe realtime
         final response = await _supabase
             .from('clients')
             .select()
-            .order('created_at');
+            .order('created_at', ascending: true);
         final remoteClients = (response as List<dynamic>)
             .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
             .toList();
         _clients
           ..clear()
           ..addAll(remoteClients);
-        _clients.sort((a, b) => (a['created_at'] as String).compareTo(b['created_at'] as String));
         notifyListeners();
         _setupRealtimeSubscription();
         return;
@@ -155,15 +151,15 @@ class QueueProvider extends ChangeNotifier {
 
       // 2️⃣ Load remote clients from Supabase
       try {
-        debugPrint('🌐 Loading remote clients from Supabase...');
+        debugPrint('Loading remote clients from Supabase...');
         final response = await _supabase
             .from('clients')
             .select()
-            .order('created_at');
+            .order('created_at', ascending: true);
         final remoteClients = (response as List<dynamic>)
             .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
             .toList();
-        debugPrint('✅ Loaded ${remoteClients.length} remote clients');
+        debugPrint('Loaded ${remoteClients.length} remote clients');
 
         // Insert into local DB if not already present
         for (var rc in remoteClients) {
@@ -298,33 +294,50 @@ class QueueProvider extends ChangeNotifier {
     return nearestRoomId;
   }
 
-  Future<void> addClient(String name) async {
+  /// Add a client and return the room name where they were assigned
+  /// If [chosenRoomId] is provided, the client will be added to that room directly (useful for offline mode)
+  /// Otherwise, geolocation-based auto-assignment will be used
+  Future<String?> addClient(String name, {String? chosenRoomId}) async {
     final trimmed = name.trim();
-    if (trimmed.isEmpty) return;
+    if (trimmed.isEmpty) return null;
 
-    debugPrint('📍 Getting location for new client...');
-    final position = await _geoService.getCurrentPosition();
+    String? roomId;
+    double clientLat;
+    double clientLng;
 
-    // Use position from GeolocationService (which has default fallback built-in)
-    final clientLat = position?.latitude ?? 40.7128; // NYC default
-    final clientLng = position?.longitude ?? -74.0060; // NYC default
-
-    if (position != null) {
-      debugPrint('✅ Location obtained: $clientLat, $clientLng');
+    // If a room is already chosen (e.g., user selected from room list), use it directly
+    if (chosenRoomId != null) {
+      debugPrint('🎯 Using pre-selected room: $chosenRoomId');
+      roomId = chosenRoomId;
+      // Set default coordinates when room is pre-selected (offline scenario)
+      clientLat = 0.0;
+      clientLng = 0.0;
+      debugPrint('📍 Skipping geolocation (room already chosen)');
     } else {
-      debugPrint('⚠️ Location not available, using default NYC location ($clientLat, $clientLng)');
+      debugPrint('Getting location for new client...');
+      final position = await _geoService.getCurrentPosition();
+
+      if (position == null) {
+        debugPrint('Location not available, cannot add client');
+        return null;
+      }
+
+      clientLat = position.latitude;
+      clientLng = position.longitude;
+      debugPrint('Location obtained: $clientLat, $clientLng');
+
+      roomId = await _findNearestRoom(clientLat, clientLng);
+
+      if (roomId == null) {
+        debugPrint('No waiting room found, cannot add client');
+        return null;
+      }
+
+      debugPrint('Auto-assigned to nearest room: $roomId');
     }
 
-    // Find nearest room based on location (AUTO-ASSIGNMENT)
-    final roomId = await _findNearestRoom(clientLat, clientLng);
-
-    // Check if room was found before inserting
-    if (roomId == null) {
-      debugPrint('❌ No waiting room found, cannot add client');
-      return;
-    }
-
-    debugPrint('🎯 Auto-assigned to nearest room: $roomId');
+    // Get the room name for the toast message
+    final roomName = getRoomName(roomId);
 
     final newClient = {
       'id': const Uuid().v4(),
@@ -344,7 +357,7 @@ class QueueProvider extends ChangeNotifier {
       if (kIsWeb) {
         // Web: ensure immediate consistency by refetching from remote
         await _refreshFromRemoteWeb();
-        return;
+        return roomName; // Return room name for toast
       }
 
       // 2️⃣ Insert locally marked as synced (native)
@@ -356,6 +369,8 @@ class QueueProvider extends ChangeNotifier {
           (a['created_at'] as String).compareTo(b['created_at'] as String));
       notifyListeners();
       debugPrint('✅ Client added to local list');
+
+      return roomName; // Return room name for toast
     } catch (e) {
       debugPrint('❌ Error adding client to Supabase: $e');
 
@@ -370,6 +385,8 @@ class QueueProvider extends ChangeNotifier {
         // 🔁 Trigger background sync retry when connectivity returns
         unawaited(_syncLocalToRemote());
       }
+
+      return roomName; // Return room name even on error (client was added locally)
     }
   }
 
@@ -451,7 +468,7 @@ class QueueProvider extends ChangeNotifier {
 
   /// Subscribe to a specific waiting room's realtime updates
   /// This cancels the current subscription and creates a new one filtered by roomId
-  void subscribeToRoom(String roomId) {
+  Future<void> subscribeToRoom(String roomId) async {
     try {
       debugPrint('🔄 Subscribing to room: $roomId');
 
@@ -461,8 +478,8 @@ class QueueProvider extends ChangeNotifier {
       // Cancel old subscription
       _channel.unsubscribe();
 
-      // Load clients for this specific room
-      _loadClientsForRoom(roomId);
+      // Load clients for this specific room (MUST await to ensure filtering happens)
+      await _loadClientsForRoom(roomId);
 
       // Create new channel with room-specific filter
       // Note: Supabase realtime filters work at the database level
@@ -520,12 +537,12 @@ class QueueProvider extends ChangeNotifier {
   /// Load clients for a specific room
   Future<void> _loadClientsForRoom(String roomId) async {
     try {
-      debugPrint('📥 Loading clients for room: $roomId');
+      debugPrint('Loading clients for room: $roomId');
       final response = await _supabase
           .from('clients')
           .select()
           .eq('waiting_room_id', roomId)
-          .order('created_at');
+          .order('created_at', ascending: true);
 
       final roomClients = (response as List<dynamic>)
           .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
@@ -534,9 +551,9 @@ class QueueProvider extends ChangeNotifier {
       _clients.clear();
       _clients.addAll(roomClients);
       notifyListeners();
-      debugPrint('✅ Loaded ${roomClients.length} clients for room');
+      debugPrint('Loaded ${roomClients.length} clients for room');
     } catch (e) {
-      debugPrint('❌ Error loading clients for room: $e');
+      debugPrint('Error loading clients for room: $e');
     }
   }
 

@@ -101,13 +101,25 @@ class MockQueueProvider extends _i1.Mock implements _i2.QueueProvider {
           as _i4.Future<void>);
 
   @override
-  _i4.Future<void> addClient(String? name) =>
+  _i4.Future<String?> addClient(
+    String? name, {
+    String? chosenRoomId,
+    String? deviceToken,
+    bool? enableNotifications = true,
+  }) =>
       (super.noSuchMethod(
-            Invocation.method(#addClient, [name]),
-            returnValue: _i4.Future<void>.value(),
-            returnValueForMissingStub: _i4.Future<void>.value(),
+            Invocation.method(
+              #addClient,
+              [name],
+              {
+                #chosenRoomId: chosenRoomId,
+                #deviceToken: deviceToken,
+                #enableNotifications: enableNotifications,
+              },
+            ),
+            returnValue: _i4.Future<String?>.value(),
           )
-          as _i4.Future<void>);
+          as _i4.Future<String?>);
 
   @override
   _i4.Future<void> removeClient(String? id) =>
@@ -128,10 +140,13 @@ class MockQueueProvider extends _i1.Mock implements _i2.QueueProvider {
           as _i4.Future<void>);
 
   @override
-  void subscribeToRoom(String? roomId) => super.noSuchMethod(
-    Invocation.method(#subscribeToRoom, [roomId]),
-    returnValueForMissingStub: null,
-  );
+  _i4.Future<void> subscribeToRoom(String? roomId) =>
+      (super.noSuchMethod(
+            Invocation.method(#subscribeToRoom, [roomId]),
+            returnValue: _i4.Future<void>.value(),
+            returnValueForMissingStub: _i4.Future<void>.value(),
+          )
+          as _i4.Future<void>);
 
   @override
   void dispose() => super.noSuchMethod(
