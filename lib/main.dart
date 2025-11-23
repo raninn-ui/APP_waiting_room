@@ -149,6 +149,27 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
     }
   }
 
+  String _formatDateTime(String? isoString) {
+    if (isoString == null) return '';
+    try {
+      final dateTime = DateTime.parse(isoString);
+      final now = DateTime.now();
+      final difference = now.difference(dateTime);
+
+      if (difference.inMinutes < 1) {
+        return 'just now';
+      } else if (difference.inMinutes < 60) {
+        return '${difference.inMinutes}m ago';
+      } else if (difference.inHours < 24) {
+        return '${difference.inHours}h ago';
+      } else {
+        return '${difference.inDays}d ago';
+      }
+    } catch (e) {
+      return '';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<QueueProvider>();
@@ -242,12 +263,60 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                   final client = provider.clients[i];
 
                   final roomName = provider.getRoomName(client['waiting_room_id']);
+                  final status = client['status'] ?? 'waiting';
+
+                  // Determine status color and icon
+                  Color statusColor;
+                  IconData statusIcon;
+                  String statusText;
+
+                  switch (status) {
+                    case 'called':
+                      statusColor = Colors.orange;
+                      statusIcon = Icons.phone_in_talk;
+                      statusText = 'Called';
+                      break;
+                    case 'served':
+                      statusColor = Colors.green;
+                      statusIcon = Icons.check_circle;
+                      statusText = 'Served';
+                      break;
+                    case 'no-show':
+                      statusColor = Colors.red;
+                      statusIcon = Icons.cancel;
+                      statusText = 'No-show';
+                      break;
+                    default: // 'waiting'
+                      statusColor = Colors.blue;
+                      statusIcon = Icons.hourglass_empty;
+                      statusText = 'Waiting';
+                  }
 
                   return Card(
                     margin: const EdgeInsets.symmetric(vertical: 4),
                     child: ListTile(
-                      leading: const Icon(Icons.person, color: Colors.blue),
-                      title: Text(client['name'] ?? 'Unnamed'),
+                      leading: Icon(statusIcon, color: statusColor),
+                      title: Row(
+                        children: [
+                          Expanded(child: Text(client['name'] ?? 'Unnamed')),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: statusColor.withOpacity(0.2),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: statusColor),
+                            ),
+                            child: Text(
+                              statusText,
+                              style: TextStyle(
+                                color: statusColor,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                       subtitle: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -263,11 +332,33 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
                                 ? '📍 Location not captured'
                                 : '📍 ${client['lat']}, ${client['lng']}',
                           ),
+                          if (client['called_at'] != null)
+                            Text(
+                              '📞 Called: ${_formatDateTime(client['called_at'])}',
+                              style: const TextStyle(fontSize: 11, color: Colors.grey),
+                            ),
                         ],
                       ),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.delete, color: Colors.red),
-                        onPressed: () => provider.removeClient(client['id']),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (status == 'called')
+                            IconButton(
+                              icon: const Icon(Icons.check, color: Colors.green),
+                              tooltip: 'Mark as Served',
+                              onPressed: () => provider.markClientAsServed(client['id']),
+                            ),
+                          if (status == 'called')
+                            IconButton(
+                              icon: const Icon(Icons.cancel, color: Colors.orange),
+                              tooltip: 'Mark as No-show',
+                              onPressed: () => provider.markClientAsNoShow(client['id']),
+                            ),
+                          IconButton(
+                            icon: const Icon(Icons.delete, color: Colors.red),
+                            onPressed: () => provider.removeClient(client['id']),
+                          ),
+                        ],
                       ),
                     ),
                   );
@@ -279,78 +370,22 @@ class _WaitingRoomPageState extends State<WaitingRoomPage> {
 
                   ElevatedButton.icon(
                     onPressed: () async {
-                      // Get the clients before removing
-                      final clients = provider.clients;
-                      if (clients.isEmpty) return;
+                      // Call the next waiting client
+                      await provider.callNextClient();
 
-                      // Get clients for current room
-                      final roomClients = widget.roomId != null
-                          ? clients.where((c) => c['waiting_room_id'] == widget.roomId).toList()
-                          : clients;
-
-                      if (roomClients.isEmpty) return;
-
-                      // Call nextClient to remove the first person
-                      await provider.nextClient();
-
-                      // Show notifications for the next people in line
                       if (mounted) {
-                        final updatedClients = provider.clients;
-                        final updatedRoomClients = widget.roomId != null
-                            ? updatedClients.where((c) => c['waiting_room_id'] == widget.roomId).toList()
-                            : updatedClients;
-
-                        // Show notification for position 2 (if exists)
-                        if (updatedRoomClients.length > 2) {
-                          final client = updatedRoomClients[2];
-                          final name = client['name'] as String;
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text('$name, only 2 people are ahead of you'),
-                              backgroundColor: Colors.blue,
-                              duration: const Duration(seconds: 3),
-                            ),
-                          );
-                        }
-
-                        // Show notification for position 1 (if exists)
-                        if (updatedRoomClients.length > 1) {
-                          final client = updatedRoomClients[1];
-                          final name = client['name'] as String;
-                          Future.delayed(const Duration(milliseconds: 500), () {
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('$name, only 1 person is ahead of you'),
-                                  backgroundColor: Colors.orange,
-                                  duration: const Duration(seconds: 3),
-                                ),
-                              );
-                            }
-                          });
-                        }
-
-                        // Show notification for position 0 (if exists)
-                        if (updatedRoomClients.isNotEmpty) {
-                          final client = updatedRoomClients[0];
-                          final name = client['name'] as String;
-                          Future.delayed(const Duration(seconds: 1), () {
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('$name, it\'s your turn!'),
-                                  backgroundColor: Colors.green,
-                                  duration: const Duration(seconds: 3),
-                                ),
-                              );
-                            }
-                          });
-                        }
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('📞 Next client has been called!'),
+                            backgroundColor: Colors.orange,
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
                       }
                     },
-                    icon: const Icon(Icons.arrow_forward),
-                    label: const Text('Next Client'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                    icon: const Icon(Icons.phone_in_talk),
+                    label: const Text('Call Next Client'),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                   ),
                 ],
               ),

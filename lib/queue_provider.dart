@@ -38,6 +38,7 @@ class QueueProvider extends ChangeNotifier {
 
   Timer? _periodicSyncTimer;
   Timer? _periodicWebRefreshTimer;
+  Timer? _noShowCheckTimer;
 
   QueueProvider({
     SupabaseClient? supabaseClient,
@@ -97,15 +98,25 @@ class QueueProvider extends ChangeNotifier {
       // Force immediate refresh once more after init
       unawaited(_refreshFromRemoteWeb());
     }
+
+    // 🔁 Start periodic no-show check (every minute)
+    _noShowCheckTimer?.cancel();
+    _noShowCheckTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
+      await _checkAndMarkNoShows();
+    });
   }
 
   Future<void> _refreshFromRemoteWeb() async {
     if (!kIsWeb) return;
     try {
-      final list = await _supabase
-          .from('clients')
-          .select()
-          .order('created_at', ascending: true);
+      // If we're subscribed to a specific room, only fetch that room's clients
+      var query = _supabase.from('clients').select();
+
+      if (_currentRoomId != null) {
+        query = query.eq('waiting_room_id', _currentRoomId!);
+      }
+
+      final list = await query.order('created_at', ascending: true);
       final remoteClients = (list as List<dynamic>)
           .map((e) => {...Map<String, dynamic>.from(e), 'is_synced': 1})
           .toList();
@@ -345,6 +356,7 @@ class QueueProvider extends ChangeNotifier {
       'lat': clientLat,
       'lng': clientLng,
       'waiting_room_id': roomId,
+      'status': 'waiting',
       'created_at': DateTime.now().toIso8601String(),
     };
 
@@ -418,6 +430,166 @@ class QueueProvider extends ChangeNotifier {
     await removeClient(first['id'] as String);
   }
 
+  /// Call the next client (mark as 'called' status)
+  Future<void> callNextClient() async {
+    // Find the first client with 'waiting' status
+    final waitingClients = _clients.where((c) => c['status'] == 'waiting').toList();
+    if (waitingClients.isEmpty) {
+      debugPrint('⚠️ No waiting clients to call');
+      return;
+    }
+
+    final clientToCall = waitingClients.first;
+    final clientId = clientToCall['id'] as String;
+    final calledAt = DateTime.now().toIso8601String();
+
+    try {
+      debugPrint('📞 Calling client: ${clientToCall['name']} (ID: $clientId)');
+
+      // Update in memory FIRST for immediate UI feedback
+      final index = _clients.indexWhere((c) => c['id'] == clientId);
+      if (index != -1) {
+        _clients[index] = {
+          ..._clients[index],
+          'status': 'called',
+          'called_at': calledAt,
+        };
+        notifyListeners();
+        debugPrint('✅ Client status updated in UI (optimistic)');
+      }
+
+      // Update in Supabase
+      await _supabase.from('clients').update({
+        'status': 'called',
+        'called_at': calledAt,
+      }).eq('id', clientId);
+
+      debugPrint('✅ Client status updated in Supabase');
+
+      if (!kIsWeb) {
+        // Update in local DB
+        await _localDb.updateClientStatus(clientId, 'called', calledAt: calledAt);
+        debugPrint('✅ Client status updated in local DB');
+      }
+
+    } catch (e) {
+      debugPrint('❌ Failed to call client: $e');
+      // Revert the optimistic update on error
+      final index = _clients.indexWhere((c) => c['id'] == clientId);
+      if (index != -1) {
+        _clients[index] = {
+          ..._clients[index],
+          'status': 'waiting',
+          'called_at': null,
+        };
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Mark a client as served (completed)
+  Future<void> markClientAsServed(String id) async {
+    await _updateClientStatus(id, 'served');
+  }
+
+  /// Mark a client as no-show
+  Future<void> markClientAsNoShow(String id) async {
+    await _updateClientStatus(id, 'no-show');
+  }
+
+  /// Update client status
+  Future<void> _updateClientStatus(String id, String status) async {
+    String? previousStatus;
+    try {
+      debugPrint('🔄 Updating client $id status to: $status');
+
+      // Update in memory FIRST for immediate UI feedback (optimistic update)
+      final index = _clients.indexWhere((c) => c['id'] == id);
+      if (index != -1) {
+        previousStatus = _clients[index]['status'] as String?;
+        _clients[index] = {
+          ..._clients[index],
+          'status': status,
+        };
+        notifyListeners();
+        debugPrint('✅ Client status updated in UI (optimistic)');
+      }
+
+      // Update in Supabase
+      await _supabase.from('clients').update({
+        'status': status,
+      }).eq('id', id);
+
+      debugPrint('✅ Client status updated in Supabase');
+
+      if (!kIsWeb) {
+        // Update in local DB
+        await _localDb.updateClientStatus(id, status);
+        debugPrint('✅ Client status updated in local DB');
+      }
+
+    } catch (e) {
+      debugPrint('❌ Failed to update client status: $e');
+      // Revert the optimistic update on error
+      if (previousStatus != null) {
+        final index = _clients.indexWhere((c) => c['id'] == id);
+        if (index != -1) {
+          _clients[index] = {
+            ..._clients[index],
+            'status': previousStatus,
+          };
+          notifyListeners();
+        }
+      }
+    }
+  }
+
+  /// Check for clients who should be marked as no-show (called > 30 minutes ago)
+  Future<void> _checkAndMarkNoShows() async {
+    try {
+      debugPrint('🔍 Checking for no-show clients...');
+
+      if (kIsWeb) {
+        // For web, query Supabase directly
+        final cutoffTime = DateTime.now().subtract(const Duration(minutes: 30)).toIso8601String();
+        final response = await _supabase
+            .from('clients')
+            .select()
+            .eq('status', 'called')
+            .lt('called_at', cutoffTime);
+
+        final noShowClients = response as List<dynamic>;
+
+        if (noShowClients.isEmpty) {
+          debugPrint('✅ No clients to mark as no-show');
+          return;
+        }
+
+        debugPrint('⚠️ Found ${noShowClients.length} clients to mark as no-show');
+
+        for (var client in noShowClients) {
+          await markClientAsNoShow(client['id'] as String);
+        }
+      } else {
+        // For native, use local DB
+        final noShowClients = await _localDb.getClientsForNoShow(30);
+
+        if (noShowClients.isEmpty) {
+          debugPrint('✅ No clients to mark as no-show');
+          return;
+        }
+
+        debugPrint('⚠️ Found ${noShowClients.length} clients to mark as no-show');
+
+        for (var client in noShowClients) {
+          await markClientAsNoShow(client['id'] as String);
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ Error checking for no-shows: $e');
+    }
+  }
+
   void _setupRealtimeSubscription({String? roomId}) {
     _channel = _supabase.channel('clients_channel');
 
@@ -426,13 +598,20 @@ class QueueProvider extends ChangeNotifier {
       table: 'clients',
       event: PostgresChangeEvent.all,
       callback: (payload) async {
+        debugPrint('🔔 Real-time event received: ${payload.eventType}');
         final event = payload.eventType;
         final record = payload.newRecord ?? payload.oldRecord;
 
-        if (record == null) return;
+        if (record == null) {
+          debugPrint('⚠️ Real-time event has no record data');
+          return;
+        }
+
+        debugPrint('📦 Record data: ${record['name']} - status: ${record['status']}');
 
         // Filter by room if roomId is specified
         if (roomId != null && record['waiting_room_id'] != roomId) {
+          debugPrint('⏭️ Skipping event - different room');
           return;
         }
 
@@ -449,6 +628,22 @@ class QueueProvider extends ChangeNotifier {
                 (a['created_at'] as String).compareTo(b['created_at'] as String));
             notifyListeners();
           }
+        } else if (event == PostgresChangeEvent.update) {
+          final id = record['id'] as String?;
+          if (id != null) {
+            final index = _clients.indexWhere((c) => c['id'] == id);
+            if (index != -1) {
+              if (!kIsWeb) {
+                await _localDb.insertClientLocally({
+                  ...Map<String, dynamic>.from(record),
+                  'is_synced': 1,
+                });
+              }
+              _clients[index] = {...record, 'is_synced': 1};
+              notifyListeners();
+              debugPrint('✅ Client updated via realtime: ${record['name']} - status: ${record['status']}');
+            }
+          }
         } else if (event == PostgresChangeEvent.delete) {
           final id = record['id'] as String?;
           if (id != null) {
@@ -463,7 +658,17 @@ class QueueProvider extends ChangeNotifier {
       },
     );
 
-    _channel.subscribe();
+    _channel.subscribe((status, error) {
+      if (status == 'SUBSCRIBED') {
+        debugPrint('✅ Real-time subscription active');
+      } else if (status == 'CHANNEL_ERROR') {
+        debugPrint('❌ Real-time subscription error: $error');
+      } else if (status == 'TIMED_OUT') {
+        debugPrint('⏱️ Real-time subscription timed out');
+      } else {
+        debugPrint('🔄 Real-time subscription status: $status');
+      }
+    });
   }
 
   /// Subscribe to a specific waiting room's realtime updates
@@ -513,6 +718,22 @@ class QueueProvider extends ChangeNotifier {
                   (a['created_at'] as String).compareTo(b['created_at'] as String));
               notifyListeners();
             }
+          } else if (event == PostgresChangeEvent.update) {
+            final id = record['id'] as String?;
+            if (id != null) {
+              final index = _clients.indexWhere((c) => c['id'] == id);
+              if (index != -1) {
+                if (!kIsWeb) {
+                  await _localDb.insertClientLocally({
+                    ...Map<String, dynamic>.from(record),
+                    'is_synced': 1,
+                  });
+                }
+                _clients[index] = {...record, 'is_synced': 1};
+                notifyListeners();
+                debugPrint('✅ Client updated via realtime (room): ${record['name']} - status: ${record['status']}');
+              }
+            }
           } else if (event == PostgresChangeEvent.delete) {
             final id = record['id'] as String?;
             if (id != null) {
@@ -527,8 +748,17 @@ class QueueProvider extends ChangeNotifier {
         },
       );
 
-      _channel.subscribe();
-      debugPrint('✅ Subscribed to room: $roomId');
+      _channel.subscribe((status, error) {
+        if (status == 'SUBSCRIBED') {
+          debugPrint('✅ Real-time subscription active for room: $roomId');
+        } else if (status == 'CHANNEL_ERROR') {
+          debugPrint('❌ Real-time subscription error for room $roomId: $error');
+        } else if (status == 'TIMED_OUT') {
+          debugPrint('⏱️ Real-time subscription timed out for room: $roomId');
+        } else {
+          debugPrint('🔄 Real-time subscription status for room $roomId: $status');
+        }
+      });
     } catch (e) {
       debugPrint('❌ Error subscribing to room: $e');
     }
@@ -563,6 +793,7 @@ class QueueProvider extends ChangeNotifier {
       _channel.unsubscribe();
       _periodicSyncTimer?.cancel();
       _periodicWebRefreshTimer?.cancel();
+      _noShowCheckTimer?.cancel();
       if (!kIsWeb) {
         _localDb.close();
       }
